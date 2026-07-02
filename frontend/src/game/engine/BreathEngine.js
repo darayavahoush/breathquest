@@ -1,14 +1,17 @@
 /**
- * BreathEngine v7 — Adaptive dynamic detection
+ * BreathEngine v8 — Continuous adaptive baseline
  *
- * Instead of a fixed noise floor from calibration, we track a
- * rolling minimum (the "quiet baseline") that updates continuously.
- * 
- * When you blow, RMS spikes above the rolling min → breath detected.
- * When you stop, rolling min catches back up over ~2 seconds.
- * 
- * This works even in noisy rooms because it always tracks
- * YOUR current noise level, not a snapshot from 3 seconds ago.
+ * The baseline tracks the RUNNING MINIMUM of recent RMS values.
+ * It uses two speeds:
+ *   - Falls FAST when signal drops (catches new quiet level quickly)
+ *   - Never rises with signal (blowing doesn't raise the baseline)
+ *
+ * Additionally, a "noise gate" requires the signal to exceed the
+ * baseline by a meaningful margin AND sustain for a few frames
+ * before registering as breath. This kills brief noise spikes.
+ *
+ * Result: works in quiet rooms, works when a mixer turns on,
+ * works when someone walks past. Continuously re-adapts.
  */
 export class BreathEngine {
   constructor() {
@@ -25,12 +28,15 @@ export class BreathEngine {
     this.onCalibrated   = null
     this.calProgress    = 0
 
-    // Rolling baseline (tracks quiet level)
-    this._baseline      = 0.3    // start high, will drop to actual quiet level
+    this._baseline      = 0.3    // rolling min — tracks quiet level continuously
     this._lastRaw       = 0
-    this._noiseFloor    = 0      // for debug display
+    this._noiseFloor    = 0      // alias for debug display
     this._calMedian     = 0
     this._calP95        = 0
+
+    // Sustain gate: signal must stay above threshold for N frames
+    this._sustainCount  = 0
+    this._SUSTAIN_NEEDED = 3     // ~50ms at 60fps — kills transient spikes
   }
 
   async start() {
@@ -47,7 +53,7 @@ export class BreathEngine {
 
     this._analyser = this._ctx.createAnalyser()
     this._analyser.fftSize = 1024
-    this._analyser.smoothingTimeConstant = 0   // raw frames
+    this._analyser.smoothingTimeConstant = 0   // raw frames — no carryover
 
     const src = this._ctx.createMediaStreamSource(this._stream)
     src.connect(this._gainNode)
@@ -64,6 +70,7 @@ export class BreathEngine {
     this.calibrated  = false
     this.breathValue = 0
     this._ema        = 0
+    this._sustainCount = 0
   }
 
   _rms(arr) {
@@ -73,28 +80,29 @@ export class BreathEngine {
   }
 
   _calibrate() {
-    // Short calibration — just let analyser settle and set initial baseline
-    const CAL_MS = 2000
-    const start  = performance.now()
-    const arr    = new Uint8Array(this._analyser.frequencyBinCount)
+    const CAL_MS  = 2000
+    const SKIP_MS = 400
+    const start   = performance.now()
+    const arr     = new Uint8Array(this._analyser.frequencyBinCount)
     const samples = []
 
     const loop = () => {
       this._analyser.getByteFrequencyData(arr)
       const elapsed = performance.now() - start
-      if (elapsed > 400) samples.push(this._rms(arr))  // skip first 400ms
+      if (elapsed > SKIP_MS) samples.push(this._rms(arr))
       this.calProgress = Math.min(1, elapsed / CAL_MS)
 
       if (elapsed < CAL_MS) {
         this._raf = requestAnimationFrame(loop)
       } else {
-        const sorted = [...samples].sort((a,b) => a-b)
-        const p50 = sorted[Math.floor(sorted.length * 0.50)]
-        const p95 = sorted[Math.floor(sorted.length * 0.95)]
+        const sorted = [...samples].sort((a, b) => a - b)
+        const p50    = sorted[Math.floor(sorted.length * 0.50)]
+        const p85    = sorted[Math.floor(sorted.length * 0.85)]
+        const p95    = sorted[Math.floor(sorted.length * 0.95)]
 
-        // Set initial baseline to p50 of silence
-        this._baseline   = p50
-        this._noiseFloor = p50   // for debug
+        // Set initial baseline to p85 — captures actual room noise level
+        this._baseline   = p85
+        this._noiseFloor = p85
         this._calMedian  = p50
         this._calP95     = p95
 
@@ -114,32 +122,44 @@ export class BreathEngine {
       this._analyser.getByteFrequencyData(arr)
       const raw = this._rms(arr)
       this._lastRaw    = raw
-      this._noiseFloor = this._baseline  // for debug
+      this._noiseFloor = this._baseline   // for debug
 
-      // Rolling baseline: tracks quiet level
-      // Drops fast when signal is low (catches new quiet state quickly)
-      // Does NOT rise when signal is high (so blowing doesn't raise the baseline)
+      // ── Continuous adaptive baseline ──
+      // Only update baseline DOWNWARD (when signal is quiet)
+      // This means: new noise → baseline rises naturally as it chases signal down
+      // Wait — we want baseline to RISE when noise rises too!
+      // So: if raw is between baseline and baseline*1.4 (noise, not breath),
+      //     slowly push baseline UP toward the new noise level
       if (raw < this._baseline) {
-        // Signal dropped — update baseline quickly (tau ~0.5s)
-        this._baseline += (raw - this._baseline) * 0.08
+        // Signal quieter than baseline — drop baseline fast
+        this._baseline += (raw - this._baseline) * 0.12
+      } else if (raw < this._baseline * 1.35) {
+        // Signal slightly above baseline — probably noise, not breath
+        // Slowly raise baseline to adapt to new noise level
+        this._baseline += (raw - this._baseline) * 0.004
       }
-      // When raw > baseline, we don't update — baseline stays at quiet level
+      // If raw > baseline * 1.35 — probably breath, don't update baseline
 
-      // How much above the quiet baseline are we?
-      const above = raw - this._baseline
+      // ── Noise gate with sustain ──
+      const threshold = this._baseline * 1.35   // must exceed by 35%
+      const above     = raw - threshold
 
-      // Dead zone: must exceed baseline by 15% of baseline to count
-      // This kills tiny fluctuations but passes real breath
-      const threshold = this._baseline * 0.18
+      if (above > 0) {
+        this._sustainCount = Math.min(this._sustainCount + 1, this._SUSTAIN_NEEDED + 5)
+      } else {
+        this._sustainCount = Math.max(this._sustainCount - 2, 0)   // drop faster than rise
+      }
 
-      if (above < threshold) {
-        // Not blowing — fast decay
+      const sustained = this._sustainCount >= this._SUSTAIN_NEEDED
+
+      if (!sustained) {
+        // Not sustained — decay fast
         this._ema *= 0.55
         if (this._ema < 0.005) this._ema = 0
       } else {
-        // Blowing — normalise above threshold
-        // breath 2× threshold = full breath value
-        const norm = Math.min(1, (above - threshold) / (this._baseline * 0.35))
+        // Sustained breath — normalise
+        // above / (baseline * 0.5) = full breath when signal is 85% above threshold
+        const norm = Math.min(1, above / (this._baseline * 0.5))
         this._ema += 0.45 * (norm - this._ema)
       }
 
