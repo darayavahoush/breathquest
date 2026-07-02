@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+backenv/
+breathenv/
+venv/
+*.egg-info/
+.env
+node_modules/
+dist/
+.DS_Store
+*.zip
